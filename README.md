@@ -28,7 +28,7 @@ A landing page with a brief description of the portal and buttons to navigate to
 ### Search Tab
 - Users can search by gene symbol, gene name, or Ensembl ID and filter by all three p values. 
 - Users can also search by trait name. 
- **This part uses inverted index search which I think should work even on a larger data base. **
+- This part uses inverted index search which I think should work even on a larger data base. 
 
 ---
 
