@@ -4,201 +4,8 @@ library(bslib)
 library(DBI)
 library(RSQLite)
 library(DT)
-
-# --------------------------------------
-# helper function for plotting the graph. 
-# --------------------------------------
-
-plot <- function(path, p){
-  data <- readRDS(path)
-  data$y <- -log10(data[[p]])
-  chromo <- sort(unique(data$Chr))
-  
-  colors <- list(
-    "P_mBATcombo" = c("#85b3d1", "#2c6fad"),
-    "P_mBAT"      = c("#ff9999", "#cc0000"),
-    "P_fastBAT"   = c("#99d899", "#228b22")
-  )
-  
-  # assign color 
-  color <- c()
-  for (i in 1:length(chromo)){
-    if (i %%2 == 0){
-      color[chromo[i]] <-  colors[[p]][1] # R list does not start from 0 ?!
-    }
-    else{
-      color[chromo[i]] <-  colors[[p]][2]
-    }
-  }
-  data$color <- color[data$Chr]
-  
-  # calculate the middle point so that we can put the label here. 
-  chr_mid <- c()
-  for (i in chromo) {
-    chr_mid[as.character(i)] <- median(data$cum_pos[data$Chr == i])
-  }
-  # add the hover text display. 
-  data$hover <- paste0(                                                                                                                                                                                                                                                     
-    "<b>", data$Symbol, "</b><br>",                                                                                                                                                                                                                                       
-    "Ensembl: ",        data$EnsemblID, "<br>",                                                                                                                                                                                                                             
-    "Chr",              data$Chr, ":", format(data$Start, big.mark = ","),                                                                                                                                                                                                   
-    "–",                format(data$End, big.mark = ","), "<br>",                                                                                                                                                                                                           
-    "No.SNPs: ",        data$No.SNPs, "<br>",                                                                                                                                                                                                                               
-    "P_mBATcombo: ",    formatC(data$P_mBATcombo,   format = "e", digits = 3), "<br>",                                                                                                                                                                                      
-    "P_mBAT: ",         formatC(data$P_mBAT,        format = "e", digits = 3), "<br>",                                                                                                                                                                                      
-    "P_fastBAT: ",      formatC(data$P_fastBAT,     format = "e", digits = 3), "<br>",                                                                                                                                                                                      
-    "TopSNP: ",         data$TopSNP, "<br>",                                                                                                                                                                                                                                
-    "TopSNP p: ",       formatC(data$TopSNP_Pvalue, format = "e", digits = 3), "<br>",                                                                                                                                                                                      
-    "No.Eigenvalues: ", data$No.Eigenvalues                                                                                                                                                                                                                                 
-  )
-  
-  graph <- plot_ly(data = data, x = ~cum_pos, y = ~y, 
-                   type = "scatter", mode = "markers", marker = list(color = ~color), 
-                   text = ~hover, hoverinfo = "text"
-                   )
-  graph <- layout(graph, 
-                  xaxis = list(title = "Chromosome", tickvals = chr_mid, ticktext = names(chr_mid)),  
-                  yaxis = list(title = paste0("-log10(", p, ")"))
-                  )
-  rm(data)                
-  return (graph)
-}
-
-# ---------------------------
-# helper function for the search. This is the stage 1 of the search function. 
-# ---------------------------
-search_gene <- function(query) {
-  gene_map <- readRDS("data/gene_symbol_map.rds")
-  hits <- gene_map[
-    grepl(query, gene_map$SYMBOL,   ignore.case = TRUE) |
-    grepl(query, gene_map$GENENAME, ignore.case = TRUE) |
-    grepl(query, gene_map$ENSEMBL, ignore.case = TRUE), 
-  ]
-  rm(gene_map)
-  return( data.frame(
-    id       = hits$ENSEMBL,
-    symbol   = hits$SYMBOL,
-    genename = hits$GENENAME,
-    stringsAsFactors = FALSE
-  ))
-}
-
-# ------------------------------------------
-# Inverted index search using SQL. 
-# ------------------------------------------
-
-reverse_index <- function(id_list, p1, p2, p3) {
-  if (length(id_list) == 0) return(data.frame())
-  
-  con <- dbConnect(RSQLite::SQLite(), "data/search.sqlite")
-  on.exit(dbDisconnect(con))
-  
-  placeholders <- paste(rep("?", length(id_list)), collapse = ", ")
-  sql <- sprintf(
-    "SELECT ensembl_id, trait_id, P_mBATcombo, P_mBAT, P_fastBAT
-     FROM associations
-     WHERE ensembl_id IN (%s)
-       AND P_mBATcombo < ?
-       AND P_mBAT      < ?
-       AND P_fastBAT   < ?",
-    placeholders
-  )
-  
-  dbGetQuery(con, sql, params = c(as.list(id_list), p1, p2, p3))
-}
-
-#-------------------------
-# helper function for search trait. 
-#-------------------------
-
-search_trait <- function(query) {
-  trait_meta <- readRDS("data/trait_metadata.rds")
-  hits <- trait_meta[
-    grepl(query, trait_meta$trait_name, ignore.case = TRUE),
-  ]
-  rm(trait_meta)
-  return (data.frame(
-    id         = hits$trait_id,
-    trait_name = hits$trait_name,
-    stringsAsFactors = FALSE
-  ))
-}
-
-#----------------------------
-# Helper function for webUI. 
-#----------------------------
-
-# Drop down for the filter
-filter_row <- function(label, id_cb, id_num) {
-  return ( 
-    div(
-    style = "display:flex; align-items:center; gap:10px; margin-bottom:8px;",
-    tags$input(type = "checkbox", id = id_cb, checked = NA,
-               style = "width:16px; height:16px; cursor:pointer;"),
-    tags$span(label, style = "width:140px;"),
-    tags$span("<"),
-    tags$input(type = "number", id = id_num, value = "0.05",
-               min = "0", max = "1", step = "0.001",
-               autocomplete = "off",
-               class = "form-control form-control-sm",
-               style = "width:90px;")
-  ) 
-  )
-}
-
-# drop down search results
-
-search_result_gene_rows <- function(search_result){
-  rows <- list()
-  for (i in seq_len(nrow(search_result))) {
-    gene_id <- search_result$id[i]
-    rows[[i]] <- div(
-      style = "padding:8px 12px; border-bottom:1px solid #f0f0f0; cursor:pointer;", 
-      onclick = sprintf("Shiny.setInputValue('gene_clicked', '%s', {priority:'event'})", gene_id),
-      tags$b(search_result$symbol[i]),
-      tags$span(
-        search_result$id[i],
-        style = "color:#6c757d; font-size:0.85em; margin-left:6px;"
-      ),
-      tags$br(),
-      tags$span(
-        search_result$genename[i],
-        style = "color:#6c757d; font-size:0.8em;"
-      )
-    )
-  }
-  
-  return (rows)
-}
-
-# Search trait drop down. TODO: merge the two drop down function. 
-
-search_result_trait_rows <- function(search_result){
-  rows <- list()
-  for (i in seq_len(nrow(search_result))) {
-    trait_id <- search_result$id[i]
-    rows[[i]] <- div(
-      style = "padding:8px 12px; border-bottom:1px solid #f0f0f0; cursor:pointer;",
-      onclick = sprintf("Shiny.setInputValue('trait_click', '%s', {priority:'event'})", trait_id),
-      tags$b(search_result$trait_name[i]),
-      tags$span(
-        search_result$id[i],
-        style = "color:#6c757d; font-size:0.85em; margin-left:6px;"
-      )
-    )
-  }
-  
-  return (rows)
-}
-
-
-stat_box <- function(label, value) {
-  div(
-    style = "color: white; text-align: center;",
-    div(style = "font-size: 1.6rem; font-weight: 700;", value),
-    div(style = "font-size: 0.8rem; opacity: 0.75; text-transform: uppercase; letter-spacing: 0.05em;", label)
-  )
-}
+source("scripts/plot_section.R")
+source("scripts/search_section.R")
 
 ui <- page_navbar(
   id    = "main_navbar",
@@ -401,6 +208,8 @@ server <- function (input, output, session){
   
   gene_query_d <- debounce(reactive(input$gene_query), 300) 
   filter_open   <- reactiveVal(FALSE)
+  gene_search_data <- reactiveVal(NULL)
+  trait_search_data <- reactiveVal(NULL) 
   
   
   observeEvent(input$filter_btn, {
@@ -421,6 +230,8 @@ server <- function (input, output, session){
     )
   })
   
+  
+  # Two functions for rendering the UI for the drop down suggestions. 
   output$gene_suggestions <- renderUI({
     
     # To avoid junk UI. 
@@ -435,7 +246,7 @@ server <- function (input, output, session){
 
     div(
       style = "border:1px solid #dee2e6; border-radius:4px; max-height:260px; overflow-y:auto; background:white;",
-      search_result_gene_rows(search_gene(q))
+      search_results_rows(search_gene(q), "gene")
     )
     
   })
@@ -452,29 +263,13 @@ server <- function (input, output, session){
     
     div(
       style = "border:1px solid #dee2e6; border-radius:4px; max-height:260px; overflow-y:auto; background:white;",
-      search_result_trait_rows(search_trait(q))
+      # Actually the tag does not matter can be aaaa. 
+      search_results_rows(search_trait(q), "trait")
     )
     
   })
   
-  search_results_data <- reactiveVal(NULL)
-  trait_search_data <- reactiveVal(NULL) 
-  
-  observeEvent(input$gene_clicked, {
-    
-    gene_id <- input$gene_clicked
-    if (is.null(gene_id) || !nzchar(gene_id)) return()
-    
-    updateTextInput(session, "gene_query", value = "")
-    
-    p1 <- if (isTRUE(input$cb_p1)) input$thresh_p1 else 1
-    p2 <- if (isTRUE(input$cb_p2)) input$thresh_p2 else 1
-    p3 <- if (isTRUE(input$cb_p3)) input$thresh_p3 else 1
-    
-    results <- reverse_index(gene_id, p1, p2, p3)
-    search_results_data(results)
-  }, ignoreInit = TRUE)
-  
+  # ------------- What happens if the user press enter. Handles for both trait and gene ---------------
   observeEvent(input$search_submit, {
     
     q <- input$search_submit$query
@@ -492,14 +287,14 @@ server <- function (input, output, session){
       traits <- search_trait(q)
       
       trait_search_data(traits)
-      search_results_data(NULL)
+      gene_search_data(NULL)
       
       return()
     }
     
     genes <- search_gene(q)
     if (nrow(genes) == 0) {
-      search_results_data(data.frame())
+      gene_search_data(data.frame())
       trait_search_data(NULL)
       return()
     }
@@ -510,85 +305,44 @@ server <- function (input, output, session){
     
     results <- reverse_index(genes$id, p1, p2, p3)
     
-    search_results_data(results)
+    gene_search_data(results)
     trait_search_data(NULL)
   }, ignoreInit = TRUE)
   
-  output$search_results <- renderUI({
+  
+  # -------- What if a drop down suggestion result is clicked. Two functions for trait and gene. -----------------------
+  
+  observeEvent(input$gene_clicked, {
     
-    traits <- trait_search_data()
-    if (!is.null(traits)) {
-      if (nrow(traits) == 0) return(NULL)
-      
-      return(
-        div(
-          class = "mt-3",
-          style = "border:1px solid #dee2e6; border-radius:4px; max-height:260px; overflow-y:auto; background:white;",
-          search_result_trait_rows(traits)
-        )
-      )
-    }
+    gene_id <- input$gene_clicked
+    if (is.null(gene_id) || !nzchar(gene_id)) return()
     
-    results <- search_results_data()
-    if (is.null(results) || nrow(results) == 0) return(NULL)
+    updateTextInput(session, "gene_query", value = "")
     
-    gene_map <- readRDS("data/gene_symbol_map.rds")
-    trait_meta <- readRDS("data/trait_metadata.rds")
+    p1 <- if (isTRUE(input$cb_p1)) input$thresh_p1 else 1
+    p2 <- if (isTRUE(input$cb_p2)) input$thresh_p2 else 1
+    p3 <- if (isTRUE(input$cb_p3)) input$thresh_p3 else 1
     
-    results$symbol     <- gene_map$SYMBOL[match(results$ensembl_id, gene_map$ENSEMBL)]
-    results$trait_name <- trait_meta$trait_name[match(results$trait_id, trait_meta$trait_id)]
-    
-    rm(gene_map)
-    rm(trait_meta)
-    
-    gene_groups <- split(results, results$ensembl_id)
-    
-    cards <- list()
-    for (ensembl_id in names(gene_groups)) {
-      g      <- gene_groups[[ensembl_id]]
-      symbol <- if (!is.na(g$symbol[1])) g$symbol[1] else ensembl_id
-      
-      trait_rows <- list()
-      for (i in seq_len(nrow(g))) {
-        tname <- if (!is.na(g$trait_name[i])) g$trait_name[i] else g$trait_id[i]
-        trait_rows[[i]] <- tags$li(
-          style = "padding:4px 0;",
-          tags$a(
-            href    = "#",
-            onclick = sprintf("Shiny.setInputValue('trait_click', '%s', {priority:'event'})", g$trait_id[i]),
-            tname
-          ),
-          tags$small(
-            style = "color:#6c757d; margin-left:16px;",
-            sprintf("P_mBATcombo: %s  |  P_mBAT: %s  |  P_fastBAT: %s",
-                    formatC(g$P_mBATcombo[i], format = "e", digits = 2),
-                    formatC(g$P_mBAT[i],      format = "e", digits = 2),
-                    formatC(g$P_fastBAT[i],   format = "e", digits = 2))
-          )
-        )
-      }
-      
-      cards[[ensembl_id]] <- div(
-        class = "card mb-3",
-        div(class = "card-header",
-            tags$b(symbol),
-            tags$span(ensembl_id, style = "color:#6c757d; font-size:0.85em; margin-left:8px;")
-        ),
-        div(class = "card-body py-2",
-            tags$ul(style = "margin:0; padding-left:20px;", trait_rows)
-        )
-      )
-    }
-    
-    div(class = "mt-3", cards)
-  })
+    results <- reverse_index(gene_id, p1, p2, p3)
+    gene_search_data(results)
+  }, ignoreInit = TRUE)
   
   observeEvent(input$trait_click, {
     trait_search_data(NULL)
-    search_results_data(NULL)
+    gene_search_data(NULL)
     
     selected_trait(input$trait_click)
     updateNavbarPage(session, "main_navbar", selected = "Results")
+  })
+  
+  # ----------------------- code that renders the output results -------------
+  
+  output$search_results <- renderUI({
+    if (input$search_type == "gene"){
+      render_results(gene_search_data(), "gene")
+    } else if (input$search_type == "trait"){
+      render_results(trait_search_data(), "trait")
+    }
   })
   
   # ----------------
