@@ -140,8 +140,17 @@ ui <- page_navbar(
                 tags$script(HTML("document.getElementById('gene_query').addEventListener('keydown', function(e) 
                 {if (e.key === 'Enter') {e.preventDefault();
                 Shiny.setInputValue('search_submit', {query: this.value,nonce: Math.random()}, {priority: 'event'});}});")),
-                uiOutput("filter_panel"),
-                uiOutput("gene_suggestions"), 
+                conditionalPanel(
+                  condition = "output.filter_visible == true",
+                  div(
+                    class = "card mt-1 p-3",
+                    style = "max-width:360px; margin-left:auto;",
+                    filter_row("P_mBATcombo", "cb_p1", "thresh_p1"),
+                    filter_row("P_mBAT",      "cb_p2", "thresh_p2"),
+                    filter_row("P_fastBAT",   "cb_p3", "thresh_p3")
+                  )
+                ),
+                uiOutput("gene_suggestions"),
                 uiOutput("trait_suggestions"),
                 uiOutput("search_results")
             )
@@ -153,7 +162,8 @@ server <- function (input, output, session){
   #------------------------------
   # the section for graph
   #------------------------------
-  selected_trait <- reactiveVal("100001")
+  selected_trait <- reactiveVal("Q_100001")
+  highlight_gene <- reactiveVal(NULL)   # ensembl id to star on the plots, or NULL
   
   output$trait_title <- renderUI({
     tid   <- selected_trait()
@@ -168,15 +178,15 @@ server <- function (input, output, session){
   })
   
   output$manhattan_mBATcombo <- renderPlotly({
-    plot(file.path("data", paste0(selected_trait(), ".rds")), "P_mBATcombo")
+    plot(file.path("data", paste0(selected_trait(), ".rds")), "P_mBATcombo", highlight_gene())
   })
-  
+
   output$manhattan_mBAT <- renderPlotly({
-    plot(file.path("data", paste0(selected_trait(), ".rds")), "P_mBAT")
+    plot(file.path("data", paste0(selected_trait(), ".rds")), "P_mBAT", highlight_gene())
   })
-  
+
   output$manhattan_fastBAT <- renderPlotly({
-    plot(file.path("data", paste0(selected_trait(), ".rds")), "P_fastBAT")
+    plot(file.path("data", paste0(selected_trait(), ".rds")), "P_fastBAT", highlight_gene())
   })
   
   output$gene_table <- renderDT({
@@ -206,29 +216,57 @@ server <- function (input, output, session){
   #---------------------------
   
   
-  gene_query_d <- debounce(reactive(input$gene_query), 300) 
-  filter_open   <- reactiveVal(FALSE)
-  gene_search_data <- reactiveVal(NULL)
-  trait_search_data <- reactiveVal(NULL) 
-  
-  
+  gene_query_d <- debounce(reactive(input$gene_query), 300)
+  filter_open  <- reactiveVal(FALSE)
+
+  # ---- gene-search state (two-level lazy: paged cards + per-card load-more) ----
+  gene_hits    <- reactiveVal(NULL)            # data.frame(id, symbol, genename)
+  gene_page    <- reactiveVal(1)               # current page of gene cards
+  gene_filters <- reactiveVal(list(p1 = NA, p2 = NA, p3 = NA))
+  gstate       <- reactiveVal(list())          # gene id -> list(rows, cursor, more)
+
+  # ---- trait-search state (render pagination only) ----
+  trait_hits   <- reactiveVal(NULL)            # data.frame(id, trait_name)
+  trait_page   <- reactiveVal(1)
+
+  # Current filter thresholds; NA means that filter is inactive (checkbox unticked).
+  current_filters <- function() {
+    active <- function(cb, num) {
+      isTRUE(cb) && length(num) && !is.na(num)
+    }
+    list(
+      p1 = if (active(input$cb_p1, input$thresh_p1)) input$thresh_p1 else NA,
+      p2 = if (active(input$cb_p2, input$thresh_p2)) input$thresh_p2 else NA,
+      p3 = if (active(input$cb_p3, input$thresh_p3)) input$thresh_p3 else NA
+    )
+  }
+
+  # Lazily fetch the first page of traits for any of `ids` not already loaded.
+  ensure_gene_loaded <- function(ids) {
+    s <- gstate(); f <- gene_filters(); changed <- FALSE
+    for (id in ids) {
+      if (is.null(s[[id]])) {
+        res  <- reverse_index_page(id, f$p1, f$p2, f$p3, after_rowid = 0, limit = PAGE_SIZE + 1)
+        more <- nrow(res) > PAGE_SIZE
+        if (more) res <- res[seq_len(PAGE_SIZE), , drop = FALSE]
+        s[[id]] <- list(rows   = res,
+                        cursor = if (nrow(res)) res$rid[nrow(res)] else 0,
+                        more   = more)
+        changed <- TRUE
+      }
+    }
+    if (changed) gstate(s)
+  }
+
   observeEvent(input$filter_btn, {
     filter_open(!filter_open())
   })
   
-  output$filter_panel <- renderUI({
-    
-    # To avoid junk UI. 
-    if (!filter_open()) return(NULL)
-    
-    div(
-      class = "card mt-1 p-3",
-      style = "max-width:360px; margin-left:auto;", 
-      filter_row("P_mBATcombo", "cb_p1", "thresh_p1"),
-      filter_row("P_mBAT",      "cb_p2", "thresh_p2"),
-      filter_row("P_fastBAT",   "cb_p3", "thresh_p3")
-    )
-  })
+  # The filter panel itself lives statically in the UI (inside a conditionalPanel)
+  # so its checkbox/number inputs are created ONCE and keep their state across
+  # open/close. This output just drives that panel's visibility.
+  output$filter_visible <- reactive({ filter_open() })
+  outputOptions(output, "filter_visible", suspendWhenHidden = FALSE)
   
   
   # Two functions for rendering the UI for the drop down suggestions. 
@@ -271,42 +309,34 @@ server <- function (input, output, session){
   
   # ------------- What happens if the user press enter. Handles for both trait and gene ---------------
   observeEvent(input$search_submit, {
-    
+
     q <- input$search_submit$query
     if (is.null(q)) q <- ""
     q <- trimws(q)
-    
     if (nchar(q) < 2) return()
-    
+
     updateTextInput(session, "gene_query", value = "")
-    
+
     search_type <- input$search_type
     if (is.null(search_type)) search_type <- "gene"
-    
+
     if (search_type == "trait") {
-      traits <- search_trait(q)
-      
-      trait_search_data(traits)
-      gene_search_data(NULL)
-      
+      trait_hits(search_trait(q))
+      trait_page(1)
+      gene_hits(NULL)
       return()
     }
-    
+
+    # gene mode: resolve matches, reset state, eagerly load only page 1's genes.
     genes <- search_gene(q)
-    if (nrow(genes) == 0) {
-      gene_search_data(data.frame())
-      trait_search_data(NULL)
-      return()
+    gene_filters(current_filters())
+    gstate(list())                 # drop any per-gene state from a previous search
+    gene_page(1)
+    gene_hits(genes)
+    trait_hits(NULL)
+    if (nrow(genes) > 0) {
+      ensure_gene_loaded(genes$id[seq_len(min(PAGE_SIZE, nrow(genes)))])
     }
-    
-    p1 <- if (isTRUE(input$cb_p1)) input$thresh_p1 else 1
-    p2 <- if (isTRUE(input$cb_p2)) input$thresh_p2 else 1
-    p3 <- if (isTRUE(input$cb_p3)) input$thresh_p3 else 1
-    
-    results <- reverse_index(genes$id, p1, p2, p3)
-    
-    gene_search_data(results)
-    trait_search_data(NULL)
   }, ignoreInit = TRUE)
   
   
@@ -319,29 +349,72 @@ server <- function (input, output, session){
     
     updateTextInput(session, "gene_query", value = "")
     
-    p1 <- if (isTRUE(input$cb_p1)) input$thresh_p1 else 1
-    p2 <- if (isTRUE(input$cb_p2)) input$thresh_p2 else 1
-    p3 <- if (isTRUE(input$cb_p3)) input$thresh_p3 else 1
+    gene_filters(current_filters())
+    gstate(list())
+    gene_page(1)
+    gene_hits(gene_row(gene_id))
+    trait_hits(NULL)
+    ensure_gene_loaded(gene_id)
     
-    results <- reverse_index(gene_id, p1, p2, p3)
-    gene_search_data(results)
   }, ignoreInit = TRUE)
   
+  # ---- load 10 more traits for one gene card (rowid cursor, appends) ----
+  observeEvent(input$load_more, {
+    id <- input$load_more$id
+    if (is.null(id)) return()
+    s  <- gstate(); st <- s[[id]]
+    if (is.null(st) || !isTRUE(st$more)) return()
+    f   <- gene_filters()
+    res <- reverse_index_page(id, f$p1, f$p2, f$p3,
+                              after_rowid = st$cursor, limit = PAGE_SIZE + 1)
+    more <- nrow(res) > PAGE_SIZE
+    if (more) res <- res[seq_len(PAGE_SIZE), , drop = FALSE]
+    s[[id]] <- list(rows   = rbind(st$rows, res),
+                    cursor = if (nrow(res)) res$rid[nrow(res)] else st$cursor,
+                    more   = more)
+    gstate(s)
+  }, ignoreInit = TRUE)
+
+  # ---- page through gene cards (lazily load the new page's genes) ----
+  observeEvent(input$gene_page, {
+    hits <- gene_hits()
+    if (is.null(hits) || nrow(hits) == 0) return()
+    npages <- max(1, ceiling(nrow(hits) / PAGE_SIZE))
+    n <- max(1, min(as.integer(input$gene_page$n), npages))
+    gene_page(n)
+    idx <- ((n - 1) * PAGE_SIZE + 1):min(n * PAGE_SIZE, nrow(hits))
+    ensure_gene_loaded(hits$id[idx])
+  }, ignoreInit = TRUE)
+
+  # ---- page through trait cards (pure render pagination) ----
+  observeEvent(input$trait_page, {
+    hits <- trait_hits()
+    if (is.null(hits) || nrow(hits) == 0) return()
+    npages <- max(1, ceiling(nrow(hits) / PAGE_SIZE))
+    trait_page(max(1, min(as.integer(input$trait_page$n), npages)))
+  }, ignoreInit = TRUE)
+
   observeEvent(input$trait_click, {
-    trait_search_data(NULL)
-    gene_search_data(NULL)
-    
-    selected_trait(input$trait_click)
+    gene_hits(NULL)
+    trait_hits(NULL)
+
+    # gene-card clicks carry the source gene to star; trait searches send gene:''
+    gid <- input$trait_click$gene
+    highlight_gene(if (is.null(gid) || !nzchar(gid)) NULL else gid)
+
+    selected_trait(input$trait_click$trait)
     updateNavbarPage(session, "main_navbar", selected = "Results")
   })
   
   # ----------------------- code that renders the output results -------------
   
   output$search_results <- renderUI({
-    if (input$search_type == "gene"){
-      render_results(gene_search_data(), "gene")
-    } else if (input$search_type == "trait"){
-      render_results(trait_search_data(), "trait")
+    mode <- input$search_type
+    if (is.null(mode)) mode <- "gene"
+    if (mode == "gene") {
+      render_gene_results(gene_hits(), gene_page(), gstate())
+    } else if (mode == "trait") {
+      render_trait_results(trait_hits(), trait_page())
     }
   })
   
@@ -354,11 +427,6 @@ server <- function (input, output, session){
   })
   observeEvent(input$home_search, {
     updateNavbarPage(session, "main_navbar", selected = "Search")
-  })
-  
-  observeEvent(input$trait_click, {
-    selected_trait(input$trait_click)
-    updateNavbarPage(session, "main_navbar", selected = "Results")
   })
   
 }
