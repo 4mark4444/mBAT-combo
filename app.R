@@ -1,11 +1,16 @@
 library(shiny)
 library(plotly)
 library(bslib)
+library(DT)
 library(DBI)
 library(RSQLite)
-library(DT)
 source("scripts/plot_section.R")
 source("scripts/search_section.R")
+
+# Gene-based Bonferroni denominator: number of genes tested (~18,645, constant
+# across traits). Read once from a representative trait file — matches the trait
+# Manhattan threshold 0.05 / (genes tested).
+N_GENES <- sum(!is.na(readRDS("data/Q_100001.rds")$P_mBATcombo))
 
 ui <- page_navbar(
   id    = "main_navbar",
@@ -43,7 +48,7 @@ ui <- page_navbar(
     gap: 42px;
   }
 
-  /* Tabs: Home, Results, Search */
+  /* Tabs: Home, Trait, Gene, Search */
   .navbar-nav .nav-link {
     position: relative;
     color: #073B78 !important;
@@ -101,18 +106,28 @@ ui <- page_navbar(
             )
   ),
   
-  nav_panel("Results",
-              uiOutput("trait_title"),
-              card(card_header("Manhattan Plot — P_mBATcombo"), plotlyOutput("manhattan_mBATcombo")),
-              card(card_header("Manhattan Plot — P_mBAT"),      plotlyOutput("manhattan_mBAT")),
-              card(card_header("Manhattan Plot — P_fastBAT"),   plotlyOutput("manhattan_fastBAT")),
-              card(
-                card_header(
-                  "Top Genes",
-                  downloadButton("download_csv", "Download CSV", class = "btn-sm btn-outline-primary float-end")
-                ),
-                DTOutput("gene_table")
-              )
+  nav_panel("Trait",
+            uiOutput("trait_title"),
+            card(card_header("Manhattan Plot — P_mBATcombo"), plotlyOutput("manhattan_mBATcombo")),
+            card(card_header("Manhattan Plot — P_mBAT (top) vs P_fastBAT (bottom)"),
+                 plotlyOutput("manhattan_mirror")),
+            card(
+              card_header(
+                "Top Genes",
+                downloadButton("download_csv", "Download CSV", class = "btn-sm btn-outline-primary float-end")
+              ),
+              DTOutput("gene_table")
+            )
+  ),
+  
+  nav_panel("Gene",
+            div(class = "container mt-5",
+                uiOutput("gene_header"),
+                card(card_header("Phenome-wide associations — Phecodes (diseases)"),
+                     plotlyOutput("gene_phecode_plot")),
+                card(card_header("Phenome-wide associations — UK Biobank fields"),
+                     plotlyOutput("gene_field_plot"))
+            )
   ),
   
   nav_panel("Search",
@@ -123,7 +138,6 @@ ui <- page_navbar(
                       id       = "search_type",
                       class    = "form-select",
                       style    = "max-width:130px;",
-                      onchange = "document.getElementById('filter_btn').style.display = this.value === 'gene' ? '' : 'none';",
                       tags$option(value = "gene",  "Gene"),
                       tags$option(value = "trait", "Trait")
                     ),
@@ -131,25 +145,13 @@ ui <- page_navbar(
                       id          = "gene_query",
                       type        = "text",
                       class       = "form-control",
-                      placeholder = "Search gene symbol or name..."
-                    ),
-                    actionButton("filter_btn", label = tagList(icon("sliders"), " Filters"),
-                                 class = "btn-outline-secondary")
+                      placeholder = "Search gene or trait..."
+                    )
                 ),
-                # to check for the enter from the search box. 
-                tags$script(HTML("document.getElementById('gene_query').addEventListener('keydown', function(e) 
+                # to check for the enter from the search box.
+                tags$script(HTML("document.getElementById('gene_query').addEventListener('keydown', function(e)
                 {if (e.key === 'Enter') {e.preventDefault();
                 Shiny.setInputValue('search_submit', {query: this.value,nonce: Math.random()}, {priority: 'event'});}});")),
-                conditionalPanel(
-                  condition = "output.filter_visible == true",
-                  div(
-                    class = "card mt-1 p-3",
-                    style = "max-width:360px; margin-left:auto;",
-                    filter_row("P_mBATcombo", "cb_p1", "thresh_p1"),
-                    filter_row("P_mBAT",      "cb_p2", "thresh_p2"),
-                    filter_row("P_fastBAT",   "cb_p3", "thresh_p3")
-                  )
-                ),
                 uiOutput("gene_suggestions"),
                 uiOutput("trait_suggestions"),
                 uiOutput("search_results")
@@ -163,30 +165,132 @@ server <- function (input, output, session){
   # the section for graph
   #------------------------------
   selected_trait <- reactiveVal("Q_100001")
-  highlight_gene <- reactiveVal(NULL)   # ensembl id to star on the plots, or NULL
+  selected_gene  <- reactiveVal("ENSG00000140718")  # default gene: FTO
+  highlight_gene <- reactiveVal(NULL)   # ensembl id to star on the Trait Manhattan plots
+  highlight_trait <- reactiveVal(NULL)  # trait id to star on the Gene PheWAS plots
+  
+  # Cross-navigation between the Trait and Gene tabs (dot clicks). Each direction
+  # stars where you came from and clears the other star.
+  open_trait_from_gene <- function(tid) {          # Gene PheWAS dot -> Trait tab
+    if (is.null(tid) || !nzchar(tid)) return()
+    highlight_gene(selected_gene()); highlight_trait(NULL)
+    selected_trait(tid)
+    updateNavbarPage(session, "main_navbar", selected = "Trait")
+  }
+  open_gene_from_trait <- function(ens) {          # Trait Manhattan dot -> Gene tab
+    if (is.null(ens) || !nzchar(ens)) return()
+    highlight_trait(selected_trait()); highlight_gene(NULL)
+    selected_gene(ens)
+    updateNavbarPage(session, "main_navbar", selected = "Gene")
+  }
+  
+  # ---- Gene tab: two PheWAS plots for the selected gene ----
+  # Fixed left-to-right order of the 18 PheWAS phecode categories (user-specified).
+  PHECODE_CATS <- c("digestive", "genitourinary", "neoplasms", "musculoskeletal",
+                    "circulatory system", "symptoms", "injuries & poisonings", "sense organs",
+                    "respiratory", "dermatologic", "neurological", "endocrine/metabolic",
+                    "infectious diseases", "mental disorders", "pregnancy complications",
+                    "hematopoietic", "congenital anomalies", "other/health-services")
+  
+  # All of the selected gene's trait associations (ascending mBAT-combo p),
+  # joined to category metadata. reactive() => computed once per gene change.
+  gene_data <- reactive({
+    gid <- selected_gene()
+    if (is.null(gid) || !nzchar(gid)) return(NULL)
+    gene_associations(gid)
+  })
+  
+  # Shared Gene-page y-scale: max capped -log10(P_mBATcombo) over all the gene's
+  # traits (both PheWAS plots), floored by the Bonferroni line, +5% headroom.
+  gene_ymax <- reactive({
+    df <- gene_data()
+    if (is.null(df) || !nrow(df)) return(NULL)
+    dmax <- max(pmin(-log10(df$P_mBATcombo), PVAL_CAP), na.rm = TRUE)
+    max(dmax, -log10(0.05 / N_GENES)) * 1.05
+  })
+  
+  output$gene_header <- renderUI({
+    gid <- selected_gene()
+    g   <- gene_row(gid)
+    sym <- if (!is.na(g$symbol) && nzchar(g$symbol)) g$symbol else gid
+    div(h2(sym),
+        tags$span(gid, style = "color:#6c757d; font-size:0.9em;"),
+        if (!is.na(g$genename) && nzchar(g$genename))
+          tags$p(g$genename, style = "color:#6c757d; margin-top:4px;"))
+  })
+  
+  # Phecode plot: x = the 18 PheWAS disease categories.
+  output$gene_phecode_plot <- renderPlotly({
+    df <- gene_data()
+    if (is.null(df) || !nrow(df)) return(plotly_empty())
+    d <- df[df$is_phecode == 1, , drop = FALSE]
+    d$cat <- d$category; d$label <- d$category
+    phewas_plot(d, levels = PHECODE_CATS, xlab = "PheWAS disease category",
+                source = "gene_phewas", highlight = highlight_trait(),
+                bonf = 0.05 / N_GENES, ymax = gene_ymax())
+  })
+  
+  # Field plot: x = secondary node, grouped (and coloured) by root.
+  output$gene_field_plot <- renderPlotly({
+    df <- gene_data()
+    if (is.null(df) || !nrow(df)) return(plotly_empty())
+    d <- df[df$is_phecode == 0, , drop = FALSE]
+    d$cat   <- paste(d$category_group, d$category, sep = " ▸ ")  # keep same-named secondaries distinct
+    d$label <- d$category
+    lv <- unique(d[order(d$category_group, d$category), c("category_group", "category")])
+    levels <- paste(lv$category_group, lv$category, sep = " ▸ ")
+    phewas_plot(d, levels = levels, xlab = "UK Biobank field category (grouped by root)",
+                source = "gene_phewas", highlight = highlight_trait(),
+                bonf = 0.05 / N_GENES, ymax = gene_ymax())
+  })
   
   output$trait_title <- renderUI({
     tid   <- selected_trait()
     trait_meta <- readRDS("data/trait_metadata.rds")
-    tname <- trait_meta$trait_name[trait_meta$trait_id == tid]
+    i     <- match(tid, trait_meta$trait_id)
+    tname <- if (is.na(i) || is.na(trait_meta$trait_name[i])) tid else trait_meta$trait_name[i]
+    add   <- if (!is.na(i) && "additional" %in% names(trait_meta)) trait_meta$additional[i] else ""
     rm(trait_meta)
-    if (length(tname) == 0 || is.na(tname)) tname <- tid
+    
+    # `additional` is a newline-separated "Label: value" block (see build_metadata.R);
+    # render each line, linking any http(s) value (download / source).
+    add_ui <- NULL
+    if (!is.null(add) && !is.na(add) && nzchar(add)) {
+      lines <- strsplit(add, "\n", fixed = TRUE)[[1]]
+      items <- lapply(lines, function(ln) {
+        p   <- regexpr(": ", ln, fixed = TRUE)            # split at the FIRST ": "
+        lab <- substr(ln, 1, p - 1)
+        val <- substr(ln, p + 2, nchar(ln))
+        vui <- if (grepl("^https?://", val)) tags$a(href = val, target = "_blank", val) else val
+        tags$div(style = "padding:2px 0;", tags$strong(paste0(lab, ": ")), vui)
+      })
+      add_ui <- card(card_header("Additional information"), items)
+    }
+    
     div(
       h2(tname),
-      tags$span(tid, style = "color:#6c757d; font-size:0.9em;")
+      tags$span(tid, style = "color:#6c757d; font-size:0.9em;"),
+      add_ui
     )
   })
   
+  # Shared Trait-page y-scale: max capped -log10(p) across all three methods,
+  # floored by the Bonferroni line, +5% headroom.
+  trait_ymax <- reactive({
+    d <- readRDS(file.path("data", paste0(selected_trait(), ".rds")))
+    dmax <- max(pmin(-log10(c(d$P_mBATcombo, d$P_mBAT, d$P_fastBAT)), PVAL_CAP), na.rm = TRUE)
+    max(dmax, -log10(0.05 / N_GENES)) * 1.05
+  })
+  
   output$manhattan_mBATcombo <- renderPlotly({
-    plot(file.path("data", paste0(selected_trait(), ".rds")), "P_mBATcombo", highlight_gene())
+    plot(file.path("data", paste0(selected_trait(), ".rds")), "P_mBATcombo",
+         highlight_gene(), source = "manhattan", ymax = trait_ymax())
   })
-
-  output$manhattan_mBAT <- renderPlotly({
-    plot(file.path("data", paste0(selected_trait(), ".rds")), "P_mBAT", highlight_gene())
-  })
-
-  output$manhattan_fastBAT <- renderPlotly({
-    plot(file.path("data", paste0(selected_trait(), ".rds")), "P_fastBAT", highlight_gene())
+  
+  output$manhattan_mirror <- renderPlotly({
+    mirror_plot(file.path("data", paste0(selected_trait(), ".rds")),
+                "P_mBAT", "P_fastBAT", highlight_gene(), source = "manhattan",
+                ymax = trait_ymax())
   })
   
   output$gene_table <- renderDT({
@@ -211,211 +315,110 @@ server <- function (input, output, session){
       write.csv(data, download_file, row.names = FALSE)
     })
   
+  # ---- dot clicks: Gene PheWAS dot -> Trait tab; Trait Manhattan dot -> Gene tab
+  observeEvent(event_data("plotly_click", source = "gene_phewas"), {
+    d <- event_data("plotly_click", source = "gene_phewas")
+    if (!is.null(d$customdata)) open_trait_from_gene(d$customdata[[1]])
+  })
+  observeEvent(event_data("plotly_click", source = "manhattan"), {
+    d <- event_data("plotly_click", source = "manhattan")
+    if (!is.null(d$customdata)) open_gene_from_trait(d$customdata[[1]])
+  })
+  
   #---------------------------
   # section for search
   #---------------------------
   
   
   gene_query_d <- debounce(reactive(input$gene_query), 300)
-  filter_open  <- reactiveVal(FALSE)
-
-  # ---- gene-search state (two-level lazy: paged cards + per-card load-more) ----
-  gene_hits    <- reactiveVal(NULL)            # data.frame(id, symbol, genename)
-  gene_page    <- reactiveVal(1)               # current page of gene cards
-  gene_filters <- reactiveVal(list(p1 = NA, p2 = NA, p3 = NA))
-  gstate       <- reactiveVal(list())          # gene id -> list(rows, cursor, more)
-
-  # ---- trait-search state (render pagination only) ----
-  trait_hits   <- reactiveVal(NULL)            # data.frame(id, trait_name)
-  trait_page   <- reactiveVal(1)
-
-  # Current filter thresholds; NA means that filter is inactive (checkbox unticked).
-  current_filters <- function() {
-    active <- function(cb, num) {
-      isTRUE(cb) && length(num) && !is.na(num)
-    }
-    list(
-      p1 = if (active(input$cb_p1, input$thresh_p1)) input$thresh_p1 else NA,
-      p2 = if (active(input$cb_p2, input$thresh_p2)) input$thresh_p2 else NA,
-      p3 = if (active(input$cb_p3, input$thresh_p3)) input$thresh_p3 else NA
-    )
-  }
-
-  # Lazily fetch the first page of traits for any of `ids` not already loaded.
-  ensure_gene_loaded <- function(ids) {
-    s <- gstate(); f <- gene_filters(); changed <- FALSE
-    for (id in ids) {
-      if (is.null(s[[id]])) {
-        res  <- reverse_index_page(id, f$p1, f$p2, f$p3, after_rowid = 0, limit = PAGE_SIZE + 1)
-        more <- nrow(res) > PAGE_SIZE
-        if (more) res <- res[seq_len(PAGE_SIZE), , drop = FALSE]
-        s[[id]] <- list(rows   = res,
-                        cursor = if (nrow(res)) res$rid[nrow(res)] else 0,
-                        more   = more)
-        changed <- TRUE
-      }
-    }
-    if (changed) gstate(s)
-  }
-
-  observeEvent(input$filter_btn, {
-    filter_open(!filter_open())
-  })
   
-  # The filter panel itself lives statically in the UI (inside a conditionalPanel)
-  # so its checkbox/number inputs are created ONCE and keep their state across
-  # open/close. This output just drives that panel's visibility.
-  output$filter_visible <- reactive({ filter_open() })
-  outputOptions(output, "filter_visible", suspendWhenHidden = FALSE)
+  # Enter-key result lists (keyword matches held for rendering); one is non-NULL
+  # at a time depending on the search mode. Each has its own page cursor.
+  gene_hits  <- reactiveVal(NULL)   # data.frame(id, symbol, genename)
+  trait_hits <- reactiveVal(NULL)   # data.frame(id, trait_name)
+  gene_page  <- reactiveVal(1)      # current page of the gene result list
+  trait_page <- reactiveVal(1)      # current page of the trait result list
   
-  
-  # Two functions for rendering the UI for the drop down suggestions. 
+  # Live drop-down suggestions (grep only), one per mode.
   output$gene_suggestions <- renderUI({
-    
-    # To avoid junk UI. 
-    if (filter_open()) return(NULL)
-    
     if (is.null(input$search_type) || input$search_type == "trait") return(NULL)
-    
     q <- gene_query_d()
-    if (nchar(q) < 2) {
-      return(NULL)
-    }
-
+    if (nchar(q) < 2) return(NULL)
     div(
       style = "border:1px solid #dee2e6; border-radius:4px; max-height:260px; overflow-y:auto; background:white;",
       search_results_rows(search_gene(q), "gene")
     )
-    
   })
   
   output$trait_suggestions <- renderUI({
-    
     if (is.null(input$search_type) || input$search_type != "trait") return(NULL)
-    
     q <- gene_query_d()
-    
-    if (nchar(q) < 2) {
-      return(NULL)
-    }
-    
+    if (nchar(q) < 2) return(NULL)
     div(
       style = "border:1px solid #dee2e6; border-radius:4px; max-height:260px; overflow-y:auto; background:white;",
-      # Actually the tag does not matter can be aaaa. 
       search_results_rows(search_trait(q), "trait")
     )
-    
   })
   
-  # ------------- What happens if the user press enter. Handles for both trait and gene ---------------
+  # Enter in the search box: keyword match, held for the persistent result list.
   observeEvent(input$search_submit, {
-
     q <- input$search_submit$query
     if (is.null(q)) q <- ""
     q <- trimws(q)
     if (nchar(q) < 2) return()
-
+    
     updateTextInput(session, "gene_query", value = "")
-
-    search_type <- input$search_type
-    if (is.null(search_type)) search_type <- "gene"
-
-    if (search_type == "trait") {
-      trait_hits(search_trait(q))
-      trait_page(1)
-      gene_hits(NULL)
-      return()
-    }
-
-    # gene mode: resolve matches, reset state, eagerly load only page 1's genes.
-    genes <- search_gene(q)
-    gene_filters(current_filters())
-    gstate(list())                 # drop any per-gene state from a previous search
-    gene_page(1)
-    gene_hits(genes)
-    trait_hits(NULL)
-    if (nrow(genes) > 0) {
-      ensure_gene_loaded(genes$id[seq_len(min(PAGE_SIZE, nrow(genes)))])
+    
+    mode <- if (is.null(input$search_type)) "gene" else input$search_type
+    if (mode == "trait") {
+      trait_hits(search_trait(q)); trait_page(1); gene_hits(NULL)
+    } else {
+      gene_hits(search_gene(q));   gene_page(1);  trait_hits(NULL)
     }
   }, ignoreInit = TRUE)
   
-  
-  # -------- What if a drop down suggestion result is clicked. Two functions for trait and gene. -----------------------
-  
+  # A gene result (dropdown or list) -> select it and jump to the Gene tab.
   observeEvent(input$gene_clicked, {
-    
-    gene_id <- input$gene_clicked
-    if (is.null(gene_id) || !nzchar(gene_id)) return()
-    
+    gid <- input$gene_clicked
+    if (is.null(gid) || !nzchar(gid)) return()
     updateTextInput(session, "gene_query", value = "")
-    
-    gene_filters(current_filters())
-    gstate(list())
-    gene_page(1)
-    gene_hits(gene_row(gene_id))
-    trait_hits(NULL)
-    ensure_gene_loaded(gene_id)
-    
+    gene_hits(NULL); trait_hits(NULL)
+    highlight_trait(NULL)            # arriving via Search -> no came-from star
+    selected_gene(gid)
+    updateNavbarPage(session, "main_navbar", selected = "Gene")
   }, ignoreInit = TRUE)
   
-  # ---- load 10 more traits for one gene card (rowid cursor, appends) ----
-  observeEvent(input$load_more, {
-    id <- input$load_more$id
-    if (is.null(id)) return()
-    s  <- gstate(); st <- s[[id]]
-    if (is.null(st) || !isTRUE(st$more)) return()
-    f   <- gene_filters()
-    res <- reverse_index_page(id, f$p1, f$p2, f$p3,
-                              after_rowid = st$cursor, limit = PAGE_SIZE + 1)
-    more <- nrow(res) > PAGE_SIZE
-    if (more) res <- res[seq_len(PAGE_SIZE), , drop = FALSE]
-    s[[id]] <- list(rows   = rbind(st$rows, res),
-                    cursor = if (nrow(res)) res$rid[nrow(res)] else st$cursor,
-                    more   = more)
-    gstate(s)
-  }, ignoreInit = TRUE)
-
-  # ---- page through gene cards (lazily load the new page's genes) ----
+  # A trait result (dropdown or list) -> select it and jump to the Trait tab.
+  # `gene` is the ensembl id to star (set when navigating from a plot; empty from
+  # a plain search).
+  observeEvent(input$trait_click, {
+    updateTextInput(session, "gene_query", value = "")
+    gene_hits(NULL); trait_hits(NULL)
+    gid <- input$trait_click$gene
+    highlight_gene(if (is.null(gid) || !nzchar(gid)) NULL else gid)
+    selected_trait(input$trait_click$trait)
+    updateNavbarPage(session, "main_navbar", selected = "Trait")
+  })
+  
+  # ---- page through the gene / trait result lists (clamp to valid range) ----
   observeEvent(input$gene_page, {
-    hits <- gene_hits()
-    if (is.null(hits) || nrow(hits) == 0) return()
+    hits <- gene_hits(); if (is.null(hits) || nrow(hits) == 0) return()
     npages <- max(1, ceiling(nrow(hits) / PAGE_SIZE))
-    n <- max(1, min(as.integer(input$gene_page$n), npages))
-    gene_page(n)
-    idx <- ((n - 1) * PAGE_SIZE + 1):min(n * PAGE_SIZE, nrow(hits))
-    ensure_gene_loaded(hits$id[idx])
+    gene_page(max(1, min(as.integer(input$gene_page$n), npages)))
   }, ignoreInit = TRUE)
-
-  # ---- page through trait cards (pure render pagination) ----
+  
   observeEvent(input$trait_page, {
-    hits <- trait_hits()
-    if (is.null(hits) || nrow(hits) == 0) return()
+    hits <- trait_hits(); if (is.null(hits) || nrow(hits) == 0) return()
     npages <- max(1, ceiling(nrow(hits) / PAGE_SIZE))
     trait_page(max(1, min(as.integer(input$trait_page$n), npages)))
   }, ignoreInit = TRUE)
-
-  observeEvent(input$trait_click, {
-    gene_hits(NULL)
-    trait_hits(NULL)
-
-    # gene-card clicks carry the source gene to star; trait searches send gene:''
-    gid <- input$trait_click$gene
-    highlight_gene(if (is.null(gid) || !nzchar(gid)) NULL else gid)
-
-    selected_trait(input$trait_click$trait)
-    updateNavbarPage(session, "main_navbar", selected = "Results")
-  })
   
-  # ----------------------- code that renders the output results -------------
-  
+  # ----------------------- render the Enter-key result list -------------
   output$search_results <- renderUI({
     mode <- input$search_type
     if (is.null(mode)) mode <- "gene"
-    if (mode == "gene") {
-      render_gene_results(gene_hits(), gene_page(), gstate())
-    } else if (mode == "trait") {
-      render_trait_results(trait_hits(), trait_page())
-    }
+    if (mode == "gene") render_results(gene_hits(),  "gene",  gene_page())
+    else                render_results(trait_hits(), "trait", trait_page())
   })
   
   # ----------------
@@ -423,7 +426,7 @@ server <- function (input, output, session){
   #-----------------
   
   observeEvent(input$home_browse, {
-    updateNavbarPage(session, "main_navbar", selected = "Results")
+    updateNavbarPage(session, "main_navbar", selected = "Trait")
   })
   observeEvent(input$home_search, {
     updateNavbarPage(session, "main_navbar", selected = "Search")
